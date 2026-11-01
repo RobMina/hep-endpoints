@@ -7,7 +7,7 @@ endpoint configuration can still change between a check and a submission.
 
 | Endpoint | Checks |
 |---|---|
-| `slurm_ssh` | with `max_su_per_job` set: estimated charge `minutes/60 * (gpus * su_per_gpu_h + cores * su_per_core_h)` at most the cap; a cap without rates refuses (fail closed). No cap configured: no budget check. |
+| `slurm_ssh` | with `max_su_per_job` set: estimated charge `minutes/60 * (gpus * su_per_gpu_h + cores * su_per_core_h)` at most the cap; a cap without rates refuses (fail closed). With a `gpu_table` and no flat rates, the table's per-type rates price the job actually submitted (after the GPU-type choice, docs/gpu-types.md). No cap configured: no budget check. |
 | `eaf` | `gpus` 0 or 1 (one MIG slice per user); with `max_age_s`: wall time within the server lifetime. At launch, a server too old to fit the job is refused. |
 | `jobsub` | positive cores, memory and minutes; a nonempty `gpu_type` must have a condor requirement in `gpu_types`; with `max_minutes`: lifetime at most the cap. |
 

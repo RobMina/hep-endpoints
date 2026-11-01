@@ -68,10 +68,19 @@ a retry of the same request reconciles (finds the job by its token) and never su
 | `cpu_partition` | `HEPEP_SLURM_CPU_PARTITION` | partition for CPU-only jobs (default: none, the site default) |
 | `max_su_per_job` | `HEPEP_SLURM_MAX_SU_PER_JOB` | budget cap per job (default: none) |
 | `su_per_gpu_h`, `su_per_core_h` | `HEPEP_SLURM_SU_PER_GPU_HOUR`, `HEPEP_SLURM_SU_PER_CORE_HOUR` | the site's charge rates |
+| `gpu_table` | | the site's GPU types and the `auto` rule (`GpuTable`; default none: jobs go as requested) |
+| `gpu_type` | | `"auto"`, a type name, or None (default: the table's `default`) |
 
 The budget estimate is `minutes/60 * (gpus * su_per_gpu_h + cores * su_per_core_h)`; for example a site charging
 53 SU per GPU-hour and 0.5 SU per core-hour charges about 19 SU for 8 cores and one GPU for 20 minutes. A cap without
-rates refuses every job. Extras for tasks that stream inputs into a running job: `read_file`, `run_on_node`,
+rates refuses every job.
+
+GPU types: with a `gpu_table`, `gpu_type="auto"` moves a GPU job to the first candidate type whose GPU and memory
+limits it fits (for example a MIG slice for small one-GPU jobs; cores capped at the slice's limit) and leaves larger
+requests on the type they asked for; an explicit type applies to every GPU job. The choice and its reason are written
+to the job script header and the record (`JobRecord.gpu_choice`), and the table's per-type rates (GPU-, core- and
+GB-hours) price the budget estimate when no flat rates are set. See [docs/gpu-types.md](docs/gpu-types.md) for the
+table, the rule and an example. Extras for tasks that stream inputs into a running job: `read_file`, `run_on_node`,
 `stream_in` (`srun --overlap` steps), and `times`.
 
 ### `eaf`
@@ -157,6 +166,7 @@ The same script runs on the grid with `JobsubEndpoint(environment=env, image=...
 ## Documentation
 
 - [docs/admission.md](docs/admission.md): what each endpoint checks before dispatch
+- [docs/gpu-types.md](docs/gpu-types.md): Slurm GPU-type table, the `auto` rule, what is recorded
 - [docs/slurm-recovery.md](docs/slurm-recovery.md): durable intents, locks, reconciliation, limits
 - [docs/jobsub.md](docs/jobsub.md): the jobsub endpoint, its job layout, and what is untested against a real grid
 - [docs/artifact-bindings.md](docs/artifact-bindings.md): snapshots, pinned inputs and image checks

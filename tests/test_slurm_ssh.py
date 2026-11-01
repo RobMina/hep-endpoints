@@ -194,3 +194,164 @@ def test_subclass_reads_its_own_variables(tmp_path, monkeypatch):
         ep.host
     monkeypatch.setenv("MYEXP_SLURM_HOST", "mine")
     assert ep.host == "mine"
+
+
+# An example site table (illustrative rates): two full cards and a MIG slice for small one-GPU jobs.
+from hependpoints.slurm_ssh import AUTO, GpuTable, GpuType  # noqa: E402
+
+TABLE = GpuTable(
+    types={"a100": GpuType(su_per_gpu_h=50.0, su_per_core_h=0.4, su_per_gb_h=0.04),
+           "a40": GpuType(su_per_gpu_h=20.0, su_per_core_h=0.3, su_per_gb_h=0.02),
+           "1g.24gb": GpuType(partition="gpu-mig", su_per_gpu_h=0.0, max_gpus=1, max_cores=4, max_mem_gb=32)},
+    auto=("1g.24gb",), cpu_su_per_core_h=0.2, cpu_su_per_gb_h=0.01, price_unknown_as="a100")
+
+
+def _ep(tmp_path, runner=None, **kw):
+    return SlurmSSHEndpoint(runner=runner or (lambda *a: None), state_dir=tmp_path / "s", host="h", account="a",
+                            workdir="/path/to/scratch/jobs", gpu_table=TABLE, **kw)
+
+
+def test_gpu_type_auto_takes_a_candidate_only_when_the_request_fits(tmp_path):
+    fits = Resources(cores=8, mem_gb=32, gpus=1, gpu_type="a100", minutes=60)       # at the slice's 32 GB limit
+    over = Resources(cores=8, mem_gb=33, gpus=1, gpu_type="a100", minutes=60)       # one GB above it
+    big = Resources(cores=16, mem_gb=110, gpus=1, gpu_type="a100", minutes=60)
+    ep = _ep(tmp_path)
+    assert ep.gpu_type == AUTO                                        # the table's default
+    mig, why = ep.gpu_choice(fits)
+    assert (mig.gpu_type, mig.cores, mig.mem_gb, mig.minutes) == ("1g.24gb", 4, 32, 60)
+    assert why["policy"] == "auto" and why["chosen"] == "1g.24gb" and why["requested"]["cores"] == 8
+    h = ep.header("p", mig, why)
+    assert "#SBATCH -p gpu-mig" in h and "#SBATCH --gres=gpu:1g.24gb:1" in h and "#SBATCH -c 4" in h
+    assert "# hepep gpu_choice " in h and '"policy": "auto"' in h and h.index("gpu_choice") < h.index("export")
+    for r in (over, big, Resources(cores=4, mem_gb=16, gpus=2, gpu_type="a100", minutes=60)):
+        kept, why = ep.gpu_choice(r)                                  # never shrinks memory or GPUs: the asked type
+        assert kept == r and why["chosen"] == "a100" and "fit none of 1g.24gb" in why["why"]
+    assert "#SBATCH -p gpu\n" in ep.header("p", over) and "--mem=33G" in ep.header("p", over)
+    assert _ep(tmp_path, gpu_type="1g.24gb").shape(big) == Resources(cores=4, mem_gb=32, gpus=1, gpu_type="1g.24gb",
+                                                                     minutes=60)
+    a40, why = _ep(tmp_path, gpu_type="a40").gpu_choice(big)          # an explicit type wins
+    assert (a40.gpu_type, a40.cores, a40.mem_gb) == ("a40", 16, 110) and why["policy"] == "explicit"
+    assert _ep(tmp_path, gpu_type=None).gpu_choice(big) == (big, None)
+    cpu = Resources(cores=2, mem_gb=8, gpus=0, gpu_type="", minutes=15)
+    assert ep.shape(cpu) == cpu and "#SBATCH -p" not in ep.header("p", cpu)
+    with pytest.raises(EndpointError, match="unknown gpu_type"):
+        _ep(tmp_path, gpu_type="h100")
+
+
+def test_gpu_table_partition_yields_to_an_explicit_partition_and_reasons_are_configurable(tmp_path):
+    fits = Resources(cores=8, mem_gb=16, gpus=1, gpu_type="a100", minutes=60)
+    assert "#SBATCH -p gpu-x" in _ep(tmp_path, partition="gpu-x").header("p", _ep(tmp_path).shape(fits))
+    table = GpuTable(types=TABLE.types, auto=("1g.24gb",), fit_reason="{mem_gb} GB fits the {type} slice",
+                     nofit_reason="{gpus} GPU(s) do not fit one {type} slice ({max_mem_gb} GB)")
+    ep = SlurmSSHEndpoint(runner=lambda *a: None, state_dir=tmp_path / "t", workdir="/path/to/w", gpu_table=table)
+    assert ep.gpu_choice(fits)[1]["why"] == "16 GB fits the 1g.24gb slice"
+    assert ep.gpu_choice(Resources(gpus=2, gpu_type="a40"))[1]["why"] == "2 GPU(s) do not fit one 1g.24gb slice (32 GB)"
+    with pytest.raises(ValueError, match="not in the table"):
+        GpuTable(types=TABLE.types, auto=("h100",))
+
+
+def test_without_a_table_requests_pass_unchanged(tmp_path):
+    ep = SlurmSSHEndpoint(runner=lambda *a: None, state_dir=tmp_path, **SITE)
+    assert ep.gpu_type is None and ep.gpu_choice(GPU) == (GPU, None) and "gpu_choice" not in ep.header("p", GPU)
+    with pytest.raises(EndpointError, match="needs a gpu_table"):
+        SlurmSSHEndpoint(runner=lambda *a: None, state_dir=tmp_path, gpu_type="auto", **SITE)
+
+
+def test_submit_records_gpu_choice(tmp_path):
+    fake = FakeSite()
+    ep = _ep(tmp_path, runner=fake, max_su_per_job=100)
+    rec = ep.submit("small", "echo hi\n", Resources(cores=8, mem_gb=24, gpus=1, gpu_type="a100", minutes=10))
+    assert rec.gpu_choice["chosen"] == "1g.24gb" and rec.resources["gpu_type"] == "1g.24gb"
+    assert ep._load_record("small").gpu_choice == rec.gpu_choice
+    assert "# hepep gpu_choice " in fake.scripts[rec.job_id]
+    rec = ep.submit("large", "echo hi\n", Resources(cores=8, mem_gb=64, gpus=1, gpu_type="a100", minutes=10))
+    assert rec.gpu_choice["chosen"] == "a100" and rec.resources["mem_gb"] == 64
+    again = ep.submit("large", "echo hi\n", Resources(cores=8, mem_gb=64, gpus=1, gpu_type="a100", minutes=10))
+    assert again.job_id == rec.job_id and len(fake.scripts) == 2
+    plain = SlurmSSHEndpoint(runner=fake, state_dir=tmp_path / "plain", **SITE)
+    assert plain.submit("p", "x\n", GPU).gpu_choice is None
+
+
+def test_submit_finds_a_record_made_before_the_table(tmp_path):
+    fake = FakeSite()
+    r = Resources(cores=8, mem_gb=24, gpus=1, gpu_type="a100", minutes=10)
+    old = SlurmSSHEndpoint(runner=fake, state_dir=tmp_path / "s", host="h", account="a",
+                           workdir="/path/to/scratch/jobs").submit("j", "x\n", r)
+    assert _ep(tmp_path, runner=fake).submit("j", "x\n", r).job_id == old.job_id and len(fake.scripts) == 1
+
+
+def test_reconciled_submission_keeps_the_gpu_choice(tmp_path):
+    fake = FakeSite()
+    lost = {"n": 0}
+
+    def flaky(cmd, stdin, timeout):
+        if "sbatch --parsable" in cmd[-1] and not lost["n"]:
+            lost["n"] = 1
+            fake(cmd, stdin, timeout)
+            raise OSError("reply lost")
+        if cmd[-1].startswith("unset SLURM_CLUSTERS; squeue"):
+            return subprocess.CompletedProcess(cmd, 0, f"{fake.next_id}|{token[0]}\n".encode(), b"")
+        if cmd[-1].startswith("unset SLURM_CLUSTERS; TZ=UTC sacct"):
+            return subprocess.CompletedProcess(cmd, 0, b"", b"")
+        return fake(cmd, stdin, timeout)
+    ep = _ep(tmp_path, runner=flaky)
+    r = Resources(cores=8, mem_gb=24, gpus=1, gpu_type="a100", minutes=10)
+    with pytest.raises(EndpointError, match="outcome uncertain"):
+        ep.submit("j", "x\n", r)
+    token = [ep._intents().get("j")["token"]]
+    rec = ep.submit("j", "x\n", r)
+    assert rec.job_id == str(fake.next_id) and rec.gpu_choice["chosen"] == "1g.24gb"
+
+
+def test_su_estimate_uses_the_table_rates_per_type():
+    assert su_estimate(Resources(cores=4, mem_gb=32, gpus=1, gpu_type="1g.24gb", minutes=60), gpu_table=TABLE) == 0.0
+    a40 = su_estimate(Resources(cores=8, mem_gb=48, gpus=1, gpu_type="a40", minutes=60), gpu_table=TABLE)
+    a100 = su_estimate(Resources(cores=8, mem_gb=48, gpus=1, gpu_type="a100", minutes=60), gpu_table=TABLE)
+    assert a40 == pytest.approx(20 + 2.4 + 0.96) and a100 == pytest.approx(50 + 3.2 + 1.92)
+    assert su_estimate(Resources(cores=8, mem_gb=48, gpus=1, gpu_type="", minutes=60), gpu_table=TABLE) == a100
+    assert su_estimate(Resources(cores=2, mem_gb=8, minutes=30), gpu_table=TABLE) == pytest.approx(0.5 * (0.4 + 0.08))
+    assert su_estimate(Resources(cores=8, gpus=1, minutes=60), 53.0, 0.5, gpu_table=TABLE) == pytest.approx(57.0)
+    with pytest.raises(EndpointError, match="no SU rates"):
+        su_estimate(Resources(gpus=1, gpu_type="h100"), gpu_table=GpuTable(types=TABLE.types))
+    with pytest.raises(EndpointError, match="flat rates or a gpu_table"):
+        su_estimate(Resources(gpus=1))
+
+
+def test_budget_prices_the_shaped_job_with_the_table(tmp_path):
+    ep = _ep(tmp_path, max_su_per_job=10)
+    ep.admit_resources(Resources(cores=8, mem_gb=32, gpus=1, gpu_type="a100", minutes=600))   # the free slice
+    with pytest.raises(EndpointError, match="exceeds max_su_per_job"):
+        ep.admit_resources(Resources(cores=8, mem_gb=33, gpus=1, gpu_type="a100", minutes=600))
+
+
+def test_record_written_before_gpu_choice_existed_still_works(tmp_path):
+    fake = FakeSite()
+    for ep in (SlurmSSHEndpoint(runner=fake, state_dir=tmp_path / "plain", **SITE), _ep(tmp_path, runner=fake)):
+        r = Resources(cores=8, mem_gb=64, gpus=1, gpu_type="a100", minutes=10)   # left on its card by "auto"
+        rec = ep.submit("old", "x\n", r)
+        path = ep.state._path("old")
+        data = json.loads(path.read_text())
+        data.pop("gpu_choice")                                         # as written before this field existed
+        path.write_text(json.dumps(data))
+        n = len(fake.scripts)
+        assert ep.status("old").state == "working"
+        again = ep.submit("old", "x\n", r)
+        assert again.job_id == rec.job_id and again.gpu_choice is None and len(fake.scripts) == n
+        fake.finish(rec.job_id)
+        assert ep.status("old").state == "completed"
+
+
+def test_auto_resubmission_compares_resolved_resources(tmp_path):
+    fake = FakeSite()
+    ep = _ep(tmp_path, runner=fake)
+    small = Resources(cores=8, mem_gb=24, gpus=1, gpu_type="a100", minutes=10)
+    rec = ep.submit("s", "x\n", small)
+    assert rec.resources["gpu_type"] == "1g.24gb"
+    assert ep.submit("s", "x\n", small).job_id == rec.job_id and len(fake.scripts) == 1
+    same_job = Resources(cores=6, mem_gb=24, gpus=1, gpu_type="a40", minutes=10)   # resolves to the same slice job
+    assert ep.submit("s", "x\n", same_job).job_id == rec.job_id and len(fake.scripts) == 1
+    for changed in (Resources(cores=8, mem_gb=20, gpus=1, gpu_type="a100", minutes=10),
+                    Resources(cores=8, mem_gb=33, gpus=1, gpu_type="a100", minutes=10)):
+        with pytest.raises(EndpointError, match="different script or resources"):
+            ep.submit("s", "x\n", changed)
+    assert len(fake.scripts) == 1
