@@ -12,6 +12,9 @@ Settings come from arguments or the environment, never from the package:
                   rates, used by the budget cap (a cap without rates refuses every job)
   state_dir       $HEPEP_STATE_DIR/<name>  local job records (default ~/.hependpoints/slurm_ssh)
   environment     JobEnvironment           variable prefix, job-name prefix, preamble of every job
+  gpu_table       GpuTable                 the site's GPU types (gres name, partition, rates, per-job limits) and the
+                  "auto" rule's candidates; default none: every job is submitted as requested
+  gpu_type        "auto", a type name, or None   how GPU jobs get their card (default: the table's ``default``)
 
 A missing required setting raises hependpoints.site.SiteConfigError naming the variable. Subclasses may read other
 variable names by overriding HOST_VARS / ACCOUNT_VARS / WORKDIR_VARS / CONFIG_HINT.
@@ -21,6 +24,11 @@ Every remote action is one ssh command through ``runner`` (injectable for tests)
 is kept in a local state dir, so a restarted caller finds its jobs. ``status`` asks ``squeue`` first and ``sacct``
 once the job has left the queue; a final state is cached locally. Budget guard: a submit whose estimated charge
 (:func:`su_estimate`) exceeds ``max_su_per_job`` is refused before anything is sent.
+GPU types (docs/gpu-types.md): with a ``gpu_table``, ``gpu_type="auto"`` moves a GPU job to the first ``auto``
+candidate whose GPU and memory limits the request fits (cores capped at the candidate's limit) and leaves any other
+request on the type it asked for; an explicit type applies to every GPU job (cores and memory capped at its limits);
+None submits every request as asked. The choice, the original request and the reason go into the job script header
+and the job record (``gpu_choice``). The table's rates also price the budget estimate when no flat rates are set.
 Durable intents and per-handle locks fence each dispatch attempt; an unrecorded intent is reconciled by exact
 scheduler comment, never blindly resubmitted. See docs/slurm-recovery.md for storage and single-cluster limits.
 """
@@ -28,13 +36,15 @@ from __future__ import annotations
 
 import datetime as dt
 import io
+import json
 import re
 import shlex
 import subprocess
 import tarfile
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 from . import EndpointError, JobRecord, JobStatus, Resources, StateDir, site, spec_sha
 from .environment import DEFAULT as DEFAULT_ENVIRONMENT, JobEnvironment
@@ -46,12 +56,92 @@ WORKING = {"PENDING", "CONFIGURING", "RUNNING", "COMPLETING", "REQUEUED", "RESIZ
 FAILED = {"FAILED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL", "BOOT_FAIL", "DEADLINE", "REVOKED", "SPECIAL_EXIT"}
 
 
-def su_estimate(r: Resources, su_per_gpu_h: float, su_per_core_h: float) -> float:
-    """Estimated charge of one job: wall hours x (GPUs x GPU rate + cores x core rate).
+AUTO = "auto"
+_TABLE_DEFAULT = object()   # gpu_type not given: the table's default
 
-    The rates are the site's, supplied as configuration. Example: a site that charges 53 SU per GPU-hour and 0.5 SU
-    per core-hour charges ``su_estimate(Resources(cores=8, gpus=1, minutes=20), 53.0, 0.5)`` = 19 SU."""
-    return r.minutes / 60.0 * (r.gpus * su_per_gpu_h + r.cores * su_per_core_h)
+
+@dataclass(frozen=True)
+class GpuType:
+    """One GPU type of a site, keyed in :class:`GpuTable` by its gres type name (``--gres=gpu:<name>:<n>``).
+
+    partition: where jobs of this type go (None: the endpoint's GPU partition). su_per_gpu_h / su_per_core_h /
+    su_per_gb_h: the charge per GPU-, core- and GB-hour of a job of this type (su_per_gpu_h None: not priced).
+    max_gpus / max_cores / max_mem_gb: the most one job of this type may ask for (None: no limit)."""
+    partition: Optional[str] = None
+    su_per_gpu_h: Optional[float] = None
+    su_per_core_h: float = 0.0
+    su_per_gb_h: float = 0.0
+    max_gpus: Optional[int] = None
+    max_cores: Optional[int] = None
+    max_mem_gb: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class GpuTable:
+    """A site's GPU types and the rule that picks one for a GPU job (supplied by the experiment or site config).
+
+    types: {gres type name: GpuType}. auto: the candidates of ``gpu_type="auto"``, most preferred first; a request
+    moves to the first candidate whose max_gpus and max_mem_gb it fits (cores are capped at its max_cores), else it
+    keeps its own type. default: the endpoint's gpu_type when none is given ("auto", a type name, or None).
+    cpu_su_per_core_h / cpu_su_per_gb_h: charge of CPU-only jobs (cpu_su_per_core_h None: not priced). price_unknown_as:
+    the type whose rates price a GPU request of a type not in the table (None: such a request is not priced).
+    fit_reason / nofit_reason: format strings of the recorded reason; fields gpus, mem_gb, cores (the request), type,
+    max_gpus, max_mem_gb, max_cores (the chosen candidate, or for nofit_reason the most preferred one), candidates."""
+    types: Mapping[str, GpuType] = field(default_factory=dict)
+    auto: Tuple[str, ...] = ()
+    default: Optional[str] = AUTO
+    cpu_su_per_core_h: Optional[float] = None
+    cpu_su_per_gb_h: float = 0.0
+    price_unknown_as: Optional[str] = None
+    fit_reason: str = "{gpus} GPU(s), {mem_gb} GB fit {type} (<= {max_mem_gb} GB, cores capped at {max_cores})"
+    nofit_reason: str = "{gpus} GPU(s), {mem_gb} GB fit none of {candidates}: the requested type"
+
+    def __post_init__(self):
+        object.__setattr__(self, "types", dict(self.types))
+        object.__setattr__(self, "auto", tuple(self.auto))
+        bad = [t for t in self.auto if t not in self.types]
+        if bad:
+            raise ValueError(f"auto candidates {bad} are not in the table's types {sorted(self.types)}")
+        for name in (self.default, self.price_unknown_as):
+            if name not in (None, AUTO) and name not in self.types:
+                raise ValueError(f"{name!r} is not in the table's types {sorted(self.types)}")
+        if self.price_unknown_as == AUTO:
+            raise ValueError("price_unknown_as names a type, not 'auto'")
+
+    def fields(self, r: Resources, name: Optional[str]) -> dict:
+        t = self.types.get(name) or GpuType()
+        return {"gpus": r.gpus, "mem_gb": r.mem_gb, "cores": r.cores, "type": name, "max_gpus": t.max_gpus,
+                "max_mem_gb": t.max_mem_gb, "max_cores": t.max_cores, "candidates": ", ".join(self.auto) or "(none)"}
+
+
+def _fits(r: Resources, t: GpuType) -> bool:
+    return (t.max_gpus is None or r.gpus <= t.max_gpus) and (t.max_mem_gb is None or r.mem_gb <= t.max_mem_gb)
+
+
+def _cap(value: int, limit: Optional[int]) -> int:
+    return value if limit is None else min(value, limit)
+
+
+def su_estimate(r: Resources, su_per_gpu_h: Optional[float] = None, su_per_core_h: Optional[float] = None,
+                gpu_table: Optional[GpuTable] = None) -> float:
+    """Estimated charge of one job.
+
+    With flat rates (either given): wall hours x (GPUs x GPU rate + cores x core rate). Example: a site that charges
+    53 SU per GPU-hour and 0.5 SU per core-hour charges ``su_estimate(Resources(cores=8, gpus=1, minutes=20), 53.0,
+    0.5)`` = 19 SU. Without flat rates, ``gpu_table``'s rates for r's type: wall hours x (GPUs x GPU rate + cores x
+    core rate + GB x GB rate), CPU-only jobs at the table's CPU rates. EndpointError when nothing prices r."""
+    if su_per_gpu_h is not None or su_per_core_h is not None:
+        return r.minutes / 60.0 * (r.gpus * (su_per_gpu_h or 0.0) + r.cores * (su_per_core_h or 0.0))
+    if gpu_table is None:
+        raise EndpointError("su_estimate needs flat rates or a gpu_table")
+    if not r.gpus:
+        if gpu_table.cpu_su_per_core_h is None:
+            raise EndpointError("the gpu_table has no CPU rates (cpu_su_per_core_h)")
+        return r.minutes / 60.0 * (r.cores * gpu_table.cpu_su_per_core_h + r.mem_gb * gpu_table.cpu_su_per_gb_h)
+    t = gpu_table.types.get(r.gpu_type) or gpu_table.types.get(gpu_table.price_unknown_as)
+    if t is None or t.su_per_gpu_h is None:
+        raise EndpointError(f"the gpu_table has no SU rates for gpu_type {r.gpu_type!r}")
+    return r.minutes / 60.0 * (r.gpus * t.su_per_gpu_h + r.cores * t.su_per_core_h + r.mem_gb * t.su_per_gb_h)
 
 
 def map_state(site_state: str, exit_code: str = "0:0") -> str:
@@ -79,9 +169,18 @@ class SlurmSSHEndpoint:
                  max_su_per_job: float | None = None, runner: Optional[Runner] = None, name: str = "slurm_ssh",
                  su_per_gpu_h: float | None = None, su_per_core_h: float | None = None, timeout_s: float = 120.0,
                  stream_runner=None, cpu_partition: str | None = None,
-                 environment: Optional[JobEnvironment] = None):
+                 environment: Optional[JobEnvironment] = None, gpu_table: Optional[GpuTable] = None,
+                 gpu_type=_TABLE_DEFAULT):
         self.name, self._host, self._account = name, host, account
+        self._partition_set = bool(partition or site.setting("HEPEP_SLURM_PARTITION"))
         self.partition = partition or site.setting("HEPEP_SLURM_PARTITION", "gpu")
+        if gpu_type is _TABLE_DEFAULT:
+            gpu_type = gpu_table.default if gpu_table is not None else None
+        if gpu_type is not None and gpu_table is None:
+            raise EndpointError(f"gpu_type {gpu_type!r} needs a gpu_table")
+        if gpu_type not in (None, AUTO) and gpu_type not in gpu_table.types:
+            raise EndpointError(f"unknown gpu_type {gpu_type!r}; known: {AUTO!r}, None, {sorted(gpu_table.types)}")
+        self.gpu_table, self.gpu_type = gpu_table, gpu_type
         self.cpu_partition = cpu_partition or site.setting("HEPEP_SLURM_CPU_PARTITION")
         self.workdir = (workdir or site.require(*self.WORKDIR_VARS, hint=self.CONFIG_HINT)).rstrip("/")
         self.state = StateDir(Path(state_dir).expanduser() if state_dir is not None else site.state_dir(name))
@@ -129,9 +228,39 @@ class SlurmSSHEndpoint:
         return f"{self.workdir}/{handle}"
 
     def _partition_for(self, r: Resources) -> str:
-        return self.partition if r.gpus else (self.cpu_partition or "")
+        if not r.gpus:
+            return self.cpu_partition or ""
+        t = self.gpu_table.types.get(r.gpu_type) if self.gpu_table is not None else None
+        return t.partition if t is not None and t.partition and not self._partition_set else self.partition
 
-    def header(self, handle: str, r: Resources) -> str:
+    def gpu_choice(self, r: Resources) -> Tuple[Resources, Optional[Dict]]:
+        """(the job actually submitted, the choice record) for request r; the record is None when r passes unchanged
+        because there is no table, gpu_type is None, or r asks for no GPU."""
+        if not r.gpus or self.gpu_type is None or self.gpu_table is None:
+            return r, None
+        table, requested = self.gpu_table, dict(r.__dict__)
+        if self.gpu_type == AUTO:
+            name = next((c for c in table.auto if _fits(r, table.types[c])), None)
+            if name is not None:
+                t = table.types[name]
+                out = type(r)(cores=_cap(r.cores, t.max_cores), mem_gb=r.mem_gb, gpus=r.gpus, gpu_type=name,
+                              minutes=r.minutes)
+                why = table.fit_reason.format(**table.fields(r, name))
+            else:
+                out = r
+                why = table.nofit_reason.format(**table.fields(r, table.auto[0] if table.auto else None))
+            return out, {"policy": AUTO, "chosen": out.gpu_type, "requested": requested, "why": why}
+        t = table.types[self.gpu_type]
+        out = type(r)(cores=_cap(r.cores, t.max_cores), mem_gb=_cap(r.mem_gb, t.max_mem_gb), gpus=r.gpus,
+                      gpu_type=self.gpu_type, minutes=r.minutes)
+        return out, {"policy": "explicit", "chosen": self.gpu_type, "requested": requested,
+                     "why": f"gpu_type={self.gpu_type} set on the endpoint"}
+
+    def shape(self, r: Resources) -> Resources:
+        """The job actually submitted for request r (gpu_choice without the record)."""
+        return self.gpu_choice(r)[0]
+
+    def header(self, handle: str, r: Resources, choice: Optional[Dict] = None) -> str:
         gres = f"gpu:{r.gpu_type}:{r.gpus}" if r.gpu_type else f"gpu:{r.gpus}"
         part = self._partition_for(r)
         lines = ["#!/bin/bash", f"#SBATCH -J {self.env.job_prefix}_{handle}"[:60], f"#SBATCH -A {self.account}"]
@@ -142,21 +271,23 @@ class SlurmSSHEndpoint:
         d = self._dir(handle)
         lines += [f"#SBATCH -c {r.cores}", f"#SBATCH --mem={r.mem_gb}G", f"#SBATCH -t {r.minutes}",
                   f"#SBATCH -o {d}/slurm.out"]
+        if choice:
+            lines.append(f"# {self.env.job_prefix} gpu_choice " + json.dumps(choice, sort_keys=True))
         return "\n".join(lines) + f"\nexport {self.env.job_dir_var}={d} {self.env.out_var}={d}/out\n"
 
-    def body(self, handle: str, script: str, r: Resources) -> str:
+    def body(self, handle: str, script: str, r: Resources, choice: Optional[Dict] = None) -> str:
         """The complete job file: header, output directory, the environment preamble, the caller's script."""
-        return (self.header(handle, r) + f"umask 077\nmkdir -p \"${self.env.out_var}\"\n" + self.env.preamble
+        return (self.header(handle, r, choice) + f"umask 077\nmkdir -p \"${self.env.out_var}\"\n" + self.env.preamble
                 + script)
 
     def admit_resources(self, resources: Resources) -> None:
         """Apply the configured per-job budget without contacting Slurm."""
         if self.max_su_per_job is None:
             return
-        if self.su_rates is None:
+        if self.su_rates is None and self.gpu_table is None:
             raise EndpointError(f"{self.name}: max_su_per_job is set but no SU rates are configured "
-                                "(su_per_gpu_h / su_per_core_h)")
-        su = su_estimate(resources, *self.su_rates)
+                                "(su_per_gpu_h / su_per_core_h, or a gpu_table)")
+        su = su_estimate(self.shape(resources), *(self.su_rates or (None, None)), gpu_table=self.gpu_table)
         if su > self.max_su_per_job:
             raise EndpointError(f"estimated {su:.0f} SU exceeds max_su_per_job {self.max_su_per_job:.0f}")
 
@@ -193,9 +324,9 @@ class SlurmSSHEndpoint:
     def _save_record(self, rec):
         durable_json(self.state._path(rec.handle), rec.__dict__)
 
-    def _adopt(self, intent, job_id):
+    def _adopt(self, intent, job_id, choice=None):
         rec = JobRecord(intent["handle"], intent["spec_sha"], job_id, intent["remote_dir"],
-                        intent["created_at"], intent["resources"])
+                        intent["created_at"], intent["resources"], gpu_choice=choice)
         self._save_record(rec)
         return rec
 
@@ -215,7 +346,7 @@ class SlurmSSHEndpoint:
                 ids.add(job_id)
         return ids
 
-    def _reconcile(self, intent):
+    def _reconcile(self, intent, choice=None):
         if intent.get("unsupported_ack"):
             raise EndpointError(f"{intent['handle']!r}: nonlocal or compound sbatch acknowledgement; "
                                 "operator investigation required; intent retained, no resubmission")
@@ -230,31 +361,41 @@ class SlurmSSHEndpoint:
             detail = "no visible matching allocation" if not ids else f"multiple matching allocations {sorted(ids)}"
             raise EndpointError(f"{intent['handle']!r}: unresolved submission ({detail}); retry the same request "
                                 "to reconcile only; do not delete the intent or submit a new handle without investigation")
-        return self._adopt(intent, ids.pop())
+        return self._adopt(intent, ids.pop(), choice)
 
     # -- interface -----------------------------------------------------------------------------------------------
     def submit(self, handle: str, script: str, resources: Resources) -> JobRecord:
         with submission_lock(self.state.root, handle):
-            return self._submit_locked(handle, script, resources)
+            if self.gpu_table is not None and self.gpu_type is not None and resources.gpus:
+                old, intent = self._load_record(handle), self._intents().get(handle)
+                if ((old is not None and old.spec_sha == spec_sha(script, resources))
+                        or (intent is not None and intent["resources"] == resources.__dict__
+                            and intent["request_sha"] == self._request(handle, script, resources)[2])):
+                    return self._submit_locked(handle, script, resources)   # recorded as requested, unshaped
+            return self._submit_locked(handle, script, *self.gpu_choice(resources))
 
-    def _submit_locked(self, handle, script, resources):
+    def _request(self, handle, script, resources, choice=None):
+        """(job file, target, request digest) of one submission."""
+        target = self._target(resources)
+        body = self.body(handle, script, resources, choice)
+        return body, target, request_digest(body, resources.__dict__, target)
+
+    def _submit_locked(self, handle, script, resources, choice=None):
         sha = spec_sha(script, resources)
         old = self._load_record(handle)
         if old is not None:
             if old.spec_sha != sha:
                 raise EndpointError(f"{handle!r} was already submitted with a different script or resources")
             return old
-        target = self._target(resources)
         d = self._dir(handle)
-        body = self.body(handle, script, resources)
-        request = request_digest(body, resources.__dict__, target)
+        body, target, request = self._request(handle, script, resources, choice)
         intents = self._intents()
         intent = intents.get(handle)
         if intent is not None:
             if (intent["request_sha"] != request or intent["spec_sha"] != sha or intent["target"] != target
                     or intent["remote_dir"] != d or intent["resources"] != resources.__dict__):
                 raise EndpointError(f"{handle!r}: pending submission has a different request or target")
-            return self._reconcile(intent)
+            return self._reconcile(intent, choice)
         self.admit_resources(resources)
         intent = intents.create(handle, sha, request, target, resources.__dict__.copy(), d, time.time())
         try:
@@ -267,7 +408,7 @@ class SlurmSSHEndpoint:
                 durable_json(intents._path(handle), intent)
             if not re.fullmatch(r"[1-9][0-9]*", job_id):
                 raise EndpointError(f"unsupported or missing local sbatch job ID: {out!r}")
-            return self._adopt(intent, job_id)
+            return self._adopt(intent, job_id, choice)
         except (EndpointError, OSError) as exc:
             raise EndpointError(f"{handle!r}: submission outcome uncertain; intent retained; retry the same request "
                                 f"to reconcile only (no automatic resubmission): {exc}") from exc
