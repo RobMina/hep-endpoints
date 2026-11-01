@@ -1,0 +1,10 @@
+hep-endpoints
+Copyright 2026 the Mu2e Genesis team (Mu2e Collaboration)
+
+Licensed under the Apache License, Version 2.0 (LICENSE).
+
+The endpoint interface, the Slurm-over-SSH and EAF adapters, the durable submission intents, the source snapshots,
+the artifact bindings and their tests were extracted from mu2e-fastsim-core (commit 27bd922) and generalized to be
+experiment-neutral; that code carries the copyright above. The jobsub_lite adapter was written for this package.
+
+No experiment-internal inputs, conditions, data or physics results are part of this repository.

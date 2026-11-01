@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hep-endpoints"
+version = "0.1.0"
+description = "Experiment-neutral adapters for running jobs on HEP compute endpoints (Slurm over SSH, FNAL EAF, FNAL jobsub_lite)"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+eaf = ["websocket-client"]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["hependpoints*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
