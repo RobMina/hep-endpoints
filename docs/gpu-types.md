@@ -52,7 +52,9 @@ reason text comes from `GpuTable.fit_reason` / `nofit_reason`, format strings wi
 none fits) and `candidates`.
 
 Submitting the same handle again with the same request returns the same job: the request is shaped the same way
-again. A record or pending intent written before the table was configured (with the unshaped request) is still
+again and compared with the record by the resolved resources. A different request that resolves to the same job
+(for example more cores, capped to the same slice) returns that job; one that resolves differently is refused as a
+changed submission. Records written before `gpu_choice` existed load unchanged (`gpu_choice` None). A record or pending intent written before the table was configured (with the unshaped request) is still
 found and is not resubmitted. A submission recovered after a lost scheduler reply keeps its choice.
 
 ## Budget

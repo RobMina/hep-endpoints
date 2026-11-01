@@ -322,3 +322,36 @@ def test_budget_prices_the_shaped_job_with_the_table(tmp_path):
     ep.admit_resources(Resources(cores=8, mem_gb=32, gpus=1, gpu_type="a100", minutes=600))   # the free slice
     with pytest.raises(EndpointError, match="exceeds max_su_per_job"):
         ep.admit_resources(Resources(cores=8, mem_gb=33, gpus=1, gpu_type="a100", minutes=600))
+
+
+def test_record_written_before_gpu_choice_existed_still_works(tmp_path):
+    fake = FakeSite()
+    for ep in (SlurmSSHEndpoint(runner=fake, state_dir=tmp_path / "plain", **SITE), _ep(tmp_path, runner=fake)):
+        r = Resources(cores=8, mem_gb=64, gpus=1, gpu_type="a100", minutes=10)   # left on its card by "auto"
+        rec = ep.submit("old", "x\n", r)
+        path = ep.state._path("old")
+        data = json.loads(path.read_text())
+        data.pop("gpu_choice")                                         # as written before this field existed
+        path.write_text(json.dumps(data))
+        n = len(fake.scripts)
+        assert ep.status("old").state == "working"
+        again = ep.submit("old", "x\n", r)
+        assert again.job_id == rec.job_id and again.gpu_choice is None and len(fake.scripts) == n
+        fake.finish(rec.job_id)
+        assert ep.status("old").state == "completed"
+
+
+def test_auto_resubmission_compares_resolved_resources(tmp_path):
+    fake = FakeSite()
+    ep = _ep(tmp_path, runner=fake)
+    small = Resources(cores=8, mem_gb=24, gpus=1, gpu_type="a100", minutes=10)
+    rec = ep.submit("s", "x\n", small)
+    assert rec.resources["gpu_type"] == "1g.24gb"
+    assert ep.submit("s", "x\n", small).job_id == rec.job_id and len(fake.scripts) == 1
+    same_job = Resources(cores=6, mem_gb=24, gpus=1, gpu_type="a40", minutes=10)   # resolves to the same slice job
+    assert ep.submit("s", "x\n", same_job).job_id == rec.job_id and len(fake.scripts) == 1
+    for changed in (Resources(cores=8, mem_gb=20, gpus=1, gpu_type="a100", minutes=10),
+                    Resources(cores=8, mem_gb=33, gpus=1, gpu_type="a100", minutes=10)):
+        with pytest.raises(EndpointError, match="different script or resources"):
+            ep.submit("s", "x\n", changed)
+    assert len(fake.scripts) == 1
