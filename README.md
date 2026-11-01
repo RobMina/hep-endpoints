@@ -27,7 +27,8 @@ python -m pytest -q
 
 The tests run offline: Slurm, the JupyterHub and the grid are fakes (the jobsub tests put stand-in `jobsub_*` and
 `ifdh` commands on `PATH` and run the rendered job in a local bash). CI (`.github/workflows/ci.yml`) runs the same
-`pytest` on every push to main and every pull request, for each supported Python version.
+`pytest` on every push to main and every pull request, on Python 3.10 to 3.14 (ubuntu-24.04); it needs no
+network site, credentials, Kerberos, jobsub or ssh.
 
 ## The interface
 
