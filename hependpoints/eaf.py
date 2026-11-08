@@ -386,7 +386,7 @@ class EAFEndpoint:
             self.keepalive()
         else:
             self._advance()
-            self.stop_idle(linger=True)
+            self._stop_when_idle()
         return js
 
     def keepalive(self) -> None:
@@ -430,12 +430,23 @@ class EAFEndpoint:
         return "cancelled"
 
     def after_results(self, handle: str) -> None:
-        """Called once a job's results are read: launch the next queued job, or stop an idle server. With a linger
-        time and nothing left to run, a detached watcher stops the server once the linger has passed (the caller may
-        never call again after its last result)."""
+        """Called once a job's results are read: launch the next queued job, or stop an idle server."""
         self._advance()
-        if not self.stop_idle(linger=True) and self.linger_s > 0 and not (self._running_job() or self._queue()):
+        self._stop_when_idle()
+
+    def _stop_when_idle(self) -> bool:
+        """Stop the server if nothing runs or waits and the linger has passed; otherwise, when it is only the linger
+        that keeps it, leave a detached watcher that stops it once the linger has passed. A caller that polls
+        `status` until a job ends and never calls again (no `after_results`) must not leave a slice running.
+        True if a stop was sent now."""
+        if self._running_job() or self._queue():
+            return False
+        if self.stop_idle(linger=True):
+            return True
+        ends = [r.resources.get("ended_at", 0.0) for r in self._records()]
+        if self.linger_s > 0 and ends and self.clock() - max(ends) < self.linger_s:
             self._spawn_watcher()
+        return False
 
     def _watcher_argv(self) -> List[str]:
         import sys
