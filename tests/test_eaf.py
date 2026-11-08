@@ -78,6 +78,14 @@ def setsid_on_path(tmp_path_factory, monkeypatch):
 needs_setsid = pytest.mark.usefixtures("setsid_on_path")
 
 
+@pytest.fixture(autouse=True)
+def watchers(monkeypatch):
+    """Record watcher spawns instead of starting a detached process against a real hub."""
+    spawned = []
+    monkeypatch.setattr(EAFEndpoint, "_spawn_watcher", lambda self: spawned.append(self.state.root))
+    return spawned
+
+
 def wait_pid(ep, h, timeout=10):
     t0 = time.time()
     while not (ep._dir(h) / "job.pid").exists() and time.time() - t0 < timeout:
@@ -244,6 +252,41 @@ def test_watcher_stops_after_linger(tmp_path):
     assert spawned == [1]                                                       # nobody may call again: a watcher
     assert ep.wait_and_stop() and hub.srv is None                               # sleeps out the linger, then stops
     assert clock.t >= ep.state.get("w").resources["ended_at"] + 120
+
+
+def test_status_alone_stops_the_server_after_the_job(tmp_path, watchers):
+    """A caller that polls status until the job ends and never calls after_results: the end of the job schedules the
+    stop (a watcher inside the linger), and the server is stopped once the linger has passed."""
+    hub = FakeHub(available=("4g.40gb",), run=False)
+    ep, clock = make(tmp_path, hub, linger_s=60)
+    ep.submit("p", "true\n", Resources(minutes=5))
+    (ep._dir("p") / "job.pid").write_text("1")
+    assert ep.status("p").state == "working" and watchers == []                  # running: no stop, no watcher
+    (ep._dir("p") / "job.done").write_text("exit=0\n")
+    assert ep.status("p").state == "completed" and hub.srv is not None          # inside the linger: kept ...
+    assert watchers == [ep.state.root]                                          # ... with a watcher to stop it
+    assert ep.wait_and_stop() and hub.srv is None and hub.stops == 1
+    ep.after_results("p")
+    assert watchers == [ep.state.root] and hub.stops == 1                       # stopped already: no second watcher
+
+
+def test_status_stops_at_once_without_linger(tmp_path, watchers):
+    hub = FakeHub(available=("4g.40gb",), run=False)
+    ep, _ = make(tmp_path, hub, linger_s=0)
+    ep.submit("z", "true\n", Resources(minutes=5))
+    (ep._dir("z") / "job.pid").write_text("1"); (ep._dir("z") / "job.done").write_text("exit=3\n")
+    assert ep.status("z").state == "failed" and hub.srv is None and watchers == []
+
+
+def test_no_watcher_while_a_queued_job_takes_the_slice(tmp_path, watchers):
+    hub = FakeHub(available=("4g.40gb",), run=False)
+    ep, clock = make(tmp_path, hub, linger_s=60)
+    ep.submit("q1", "true\n", Resources(minutes=5))
+    clock.t += 1
+    ep.submit("q2", "true\n", Resources(minutes=5))
+    (ep._dir("q1") / "job.pid").write_text("1"); (ep._dir("q1") / "job.done").write_text("exit=0\n")
+    assert ep.status("q1").state == "completed"
+    assert ep.state.get("q2").resources.get("launched_at") and watchers == [] and hub.srv is not None
 
 
 def test_environment_prefix_preamble_and_runtime_hook(tmp_path):

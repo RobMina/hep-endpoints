@@ -94,7 +94,10 @@ table, the rule and an example. Extras for tasks that stream inputs into a runni
 | `linger_s` | `HEPEP_EAF_LINGER_S` (or `EAF_LINGER_S`) | idle time before the server is stopped (default 120 s) |
 | `max_age_s` | `HEPEP_EAF_MAX_AGE_S` (or `EAF_MAX_AGE_S`) | server lifetime, if the hub enforces one |
 
-One job runs at a time on the user's single slice; later submits queue and launch on later `status` calls.
+One job runs at a time on the user's single slice; later submits queue and launch on later `status` calls. When a
+`status` call (or `after_results`) sees the last job end, the server is stopped once `linger_s` has passed: at once
+if it already has, otherwise by a detached `stop-idle --wait` watcher, so a caller that stops polling does not leave
+the slice running.
 `python -m hependpoints.eaf {server,jobs,stop-idle}` inspects or stops the server.
 
 ### `jobsub`
