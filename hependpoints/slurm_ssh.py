@@ -29,6 +29,9 @@ candidate whose GPU and memory limits the request fits (cores capped at the cand
 request on the type it asked for; an explicit type applies to every GPU job (cores and memory capped at its limits);
 None submits every request as asked. The choice, the original request and the reason go into the job script header
 and the job record (``gpu_choice``). The table's rates also price the budget estimate when no flat rates are set.
+Dependencies: ``submit(..., after=[handle, ...])`` starts the job only after those earlier jobs of this endpoint have
+completed successfully (``--dependency=afterok:<ids>``); if one of them fails, Slurm cancels the job
+(``--kill-on-invalid-dep=yes``) and its status becomes ``cancelled``.
 Durable intents and per-handle locks fence each dispatch attempt; an unrecorded intent is reconciled by exact
 scheduler comment, never blindly resubmitted. See docs/slurm-recovery.md for storage and single-cluster limits.
 """
@@ -260,7 +263,7 @@ class SlurmSSHEndpoint:
         """The job actually submitted for request r (gpu_choice without the record)."""
         return self.gpu_choice(r)[0]
 
-    def header(self, handle: str, r: Resources, choice: Optional[Dict] = None) -> str:
+    def header(self, handle: str, r: Resources, choice: Optional[Dict] = None, after: Sequence[str] = ()) -> str:
         gres = f"gpu:{r.gpu_type}:{r.gpus}" if r.gpu_type else f"gpu:{r.gpus}"
         part = self._partition_for(r)
         lines = ["#!/bin/bash", f"#SBATCH -J {self.env.job_prefix}_{handle}"[:60], f"#SBATCH -A {self.account}"]
@@ -271,13 +274,17 @@ class SlurmSSHEndpoint:
         d = self._dir(handle)
         lines += [f"#SBATCH -c {r.cores}", f"#SBATCH --mem={r.mem_gb}G", f"#SBATCH -t {r.minutes}",
                   f"#SBATCH -o {d}/slurm.out"]
+        if after:
+            lines += [f"#SBATCH --dependency=afterok:{':'.join(after)}", "#SBATCH --kill-on-invalid-dep=yes"]
         if choice:
             lines.append(f"# {self.env.job_prefix} gpu_choice " + json.dumps(choice, sort_keys=True))
         return "\n".join(lines) + f"\nexport {self.env.job_dir_var}={d} {self.env.out_var}={d}/out\n"
 
-    def body(self, handle: str, script: str, r: Resources, choice: Optional[Dict] = None) -> str:
-        """The complete job file: header, output directory, the environment preamble, the caller's script."""
-        return (self.header(handle, r, choice) + f"umask 077\nmkdir -p \"${self.env.out_var}\"\n" + self.env.preamble
+    def body(self, handle: str, script: str, r: Resources, choice: Optional[Dict] = None,
+             after: Sequence[str] = ()) -> str:
+        """The complete job file: header, output directory, the environment preamble, the caller's script. `after`:
+        Slurm job ids the job waits for (afterok)."""
+        return (self.header(handle, r, choice, after) + f"umask 077\nmkdir -p \"${self.env.out_var}\"\n" + self.env.preamble
                 + script)
 
     def admit_resources(self, resources: Resources) -> None:
@@ -364,23 +371,37 @@ class SlurmSSHEndpoint:
         return self._adopt(intent, ids.pop(), choice)
 
     # -- interface -----------------------------------------------------------------------------------------------
-    def submit(self, handle: str, script: str, resources: Resources) -> JobRecord:
+    def submit(self, handle: str, script: str, resources: Resources, after: Sequence[str] = ()) -> JobRecord:
+        """Submit (idempotent per handle). `after`: handles of earlier jobs of this endpoint that must complete
+        successfully first (Slurm afterok on their recorded job ids)."""
+        deps = self._dependency_ids(after)
         with submission_lock(self.state.root, handle):
             if self.gpu_table is not None and self.gpu_type is not None and resources.gpus:
                 old, intent = self._load_record(handle), self._intents().get(handle)
                 if ((old is not None and old.spec_sha == spec_sha(script, resources))
                         or (intent is not None and intent["resources"] == resources.__dict__
-                            and intent["request_sha"] == self._request(handle, script, resources)[2])):
-                    return self._submit_locked(handle, script, resources)   # recorded as requested, unshaped
-            return self._submit_locked(handle, script, *self.gpu_choice(resources))
+                            and intent["request_sha"] == self._request(handle, script, resources, None, deps)[2])):
+                    return self._submit_locked(handle, script, resources, None, deps)  # recorded as requested
+            return self._submit_locked(handle, script, *self.gpu_choice(resources), deps)
 
-    def _request(self, handle, script, resources, choice=None):
+    def _dependency_ids(self, after: Sequence[str]) -> Tuple[str, ...]:
+        if isinstance(after, str):
+            raise EndpointError("after: a sequence of handles, not one string")
+        ids = []
+        for h in after:
+            rec = self._load_record(h)
+            if rec is None:
+                raise EndpointError(f"{self.name}: dependency {h!r} has no job record on this endpoint")
+            ids.append(rec.job_id)
+        return tuple(ids)
+
+    def _request(self, handle, script, resources, choice=None, deps=()):
         """(job file, target, request digest) of one submission."""
         target = self._target(resources)
-        body = self.body(handle, script, resources, choice)
+        body = self.body(handle, script, resources, choice, deps)
         return body, target, request_digest(body, resources.__dict__, target)
 
-    def _submit_locked(self, handle, script, resources, choice=None):
+    def _submit_locked(self, handle, script, resources, choice=None, deps=()):
         sha = spec_sha(script, resources)
         old = self._load_record(handle)
         if old is not None:
@@ -388,7 +409,7 @@ class SlurmSSHEndpoint:
                 raise EndpointError(f"{handle!r} was already submitted with a different script or resources")
             return old
         d = self._dir(handle)
-        body, target, request = self._request(handle, script, resources, choice)
+        body, target, request = self._request(handle, script, resources, choice, deps)
         intents = self._intents()
         intent = intents.get(handle)
         if intent is not None:

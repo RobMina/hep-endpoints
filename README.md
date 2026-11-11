@@ -83,6 +83,12 @@ GB-hours) price the budget estimate when no flat rates are set. See [docs/gpu-ty
 table, the rule and an example. Extras for tasks that stream inputs into a running job: `read_file`, `run_on_node`,
 `stream_in` (`srun --overlap` steps), and `times`.
 
+Dependencies: `ep.submit(handle, script, resources, after=["gen"])` holds the job until the jobs submitted under
+those handles (on the same endpoint) have completed successfully (`--dependency=afterok:<ids>`), so a GPU stage and
+a CPU stage that reads its output can be two jobs, each on its own partition, without a caller waiting in between.
+If a dependency fails, Slurm cancels the job (`--kill-on-invalid-dep=yes`) and its status is `cancelled`. The
+dependency lines are part of the job file, so they are part of the request's identity.
+
 ### `eaf`
 
 | Argument | Variable | Meaning |

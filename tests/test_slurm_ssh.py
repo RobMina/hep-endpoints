@@ -355,3 +355,24 @@ def test_auto_resubmission_compares_resolved_resources(tmp_path):
         with pytest.raises(EndpointError, match="different script or resources"):
             ep.submit("s", "x\n", changed)
     assert len(fake.scripts) == 1
+
+
+def test_after_makes_a_job_wait_for_earlier_handles(site_ep):
+    fake, ep = site_ep
+    gen = ep.submit("chain.gen", "gen\n", GPU)
+    sim = ep.submit("chain.sim", "sim\n", Resources(cores=1, mem_gb=8, minutes=60), after=["chain.gen"])
+    script = fake.scripts[sim.job_id]
+    assert f"#SBATCH --dependency=afterok:{gen.job_id}\n#SBATCH --kill-on-invalid-dep=yes\n" in script
+    assert "#SBATCH -p standard" in script and "--dependency" not in fake.scripts[gen.job_id]
+    # idempotent with the same dependency; a dependency on an unknown handle is refused before anything is sent
+    assert ep.submit("chain.sim", "sim\n", Resources(cores=1, mem_gb=8, minutes=60), after=["chain.gen"]) == sim
+    n = len(fake.calls)
+    with pytest.raises(EndpointError, match="no job record"):
+        ep.submit("chain.other", "x\n", Resources(minutes=5), after=["nope"])
+    with pytest.raises(EndpointError, match="sequence of handles"):
+        ep.submit("chain.other", "x\n", Resources(minutes=5), after="chain.gen")
+    assert len(fake.calls) == n
+    # Slurm cancels a job whose dependency can never be satisfied: it reports as cancelled
+    fake.finish(gen.job_id, "FAILED", "1:0")
+    fake.finish(sim.job_id, "CANCELLED", "0:0")
+    assert ep.status("chain.gen").state == "failed" and ep.status("chain.sim").state == "cancelled"
