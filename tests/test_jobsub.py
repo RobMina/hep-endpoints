@@ -1,5 +1,6 @@
 """jobsub endpoint against a fake grid: the jobsub_* and ifdh commands are stand-ins on PATH (tests/fakegrid.py), the
 endpoint's commands and the rendered job run in a real local bash. No schedd, token, ssh or dCache is contacted."""
+import hashlib
 import json
 import os
 import signal
@@ -14,7 +15,7 @@ import pytest
 
 from hependpoints import EndpointError, JobRecord, Resources, site
 from hependpoints.environment import JobEnvironment
-from hependpoints.jobsub import JobsubEndpoint, parse_queue, parse_submit
+from hependpoints.jobsub import JobsubEndpoint, parse_queue, parse_submit, token_path
 from hependpoints.runners import local_runner
 from hependpoints.submission import IntentStore
 
@@ -383,3 +384,89 @@ def test_settings_from_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("HEPEP_JOBSUB_DROPBOX", "ftp")
     with pytest.raises(EndpointError, match="dropbox"):
         JobsubEndpoint()
+
+
+# -- token scope and staging -----------------------------------------------------------------------------------------
+def test_token_path_drops_the_mount_prefix_and_is_the_default_scope(grid, tmp_path, monkeypatch):
+    mount = "/" + "pnfs/"
+    assert token_path(mount + "vo/scratch/users/x/out") == "/vo/scratch/users/x/out"
+    assert token_path("/vo/scratch/x") == "/vo/scratch/x" and token_path(str(tmp_path)) == str(tmp_path)
+    assert token_path("/dc/vo/x", "/dc") == "/vo/x" == token_path("/dc/vo/x", "/dc/")
+    ep = make(tmp_path, grid, output_dir=mount + "vo/scratch/users/x/out")
+    assert ep.storage_modify == "/vo/scratch/users/x/out"
+    assert "--need-storage-modify=/vo/scratch/users/x/out" in ep.submit_argv("p", "t", R)
+    monkeypatch.setenv("HEPEP_JOBSUB_MOUNT_PREFIX", "/dc/")
+    assert make(tmp_path, grid, output_dir="/dc/vo/out").storage_modify == "/vo/out"
+    assert make(tmp_path, grid, output_dir="/dc/vo/out", storage_modify="/vo").storage_modify == "/vo"
+
+
+def _pin(path):
+    data = Path(path).read_bytes()
+    return hashlib.sha256(data).hexdigest(), len(data)
+
+
+def test_stage_file_copies_verifies_records_and_reuses(grid, tmp_path):
+    ep = make(tmp_path, grid, stage_dir=str(grid.dcache / "stage"))
+    src = tmp_path / "table.npz"
+    src.write_bytes(b"table bytes")
+    sha, size = _pin(src)
+    dest = ep.stage_file(str(src), "inputs", "table.npz", sha, size)
+    assert dest == f"{grid.dcache}/stage/inputs/{sha[:16]}/table.npz" == ep.staged_path("inputs", sha, "table.npz")
+    assert Path(dest).read_bytes() == b"table bytes" and ep.remote_sha256(dest) == sha
+    n = len(grid.calls)
+    assert ep.stage_file(str(src), "inputs", "table.npz", sha, size) == dest and len(grid.calls) == n   # recorded
+    assert ep.remote_sha256(f"{grid.dcache}/stage/absent") is None
+
+
+def test_stage_file_refuses_a_changed_source_and_a_bad_copy(grid, tmp_path, monkeypatch):
+    ep = make(tmp_path, grid, stage_dir=str(grid.dcache / "stage"))
+    src = tmp_path / "a.bin"
+    src.write_bytes(b"one")
+    sha, size = _pin(src)
+    src.write_bytes(b"two")
+    with pytest.raises(EndpointError, match="not the pinned file"):
+        ep.stage_file(str(src), "inputs", "a.bin", sha, size)
+    src.write_bytes(b"one")
+    monkeypatch.setattr(ep, "remote_sha256", lambda path: "0" * 64)       # the dCache copy reads back differently
+    with pytest.raises(EndpointError, match="does not match"):
+        ep.stage_file(str(src), "inputs", "a.bin", sha, size)
+    assert not list((ep.state.root / "staged").glob("*.json"))            # nothing recorded as verified
+    monkeypatch.undo()
+    assert ep.stage_file(str(src), "inputs", "a.bin", sha, size).endswith("/a.bin")
+
+
+def test_staging_needs_a_stage_dir_and_safe_keys(grid, tmp_path):
+    with pytest.raises(EndpointError, match="no stage_dir"):
+        make(tmp_path, grid).staged_path("inputs", "a" * 64, "x")
+    ep = make(tmp_path, grid, stage_dir=str(grid.dcache / "stage"))
+    for key in (("../up", "a" * 64, "x"), ("inputs", "short", "x"), ("inputs", "a" * 64, "x/../y")):
+        with pytest.raises(EndpointError, match="bad staging key"):
+            ep.staged_path(*key)
+    with pytest.raises(EndpointError, match="absolute"):
+        make(tmp_path, grid, stage_dir="relative/stage")
+
+
+def test_a_staged_file_reaches_the_job(grid, tmp_path):
+    ep = make(tmp_path, grid, stage_dir=str(grid.dcache / "stage"))
+    src = tmp_path / "in.txt"
+    src.write_bytes(b"payload\n")
+    sha, size = _pin(src)
+    dest = ep.stage_file(str(src), "inputs", "in.txt", sha, size)
+    script = (f"ifdh cp {dest} \"$HEPEP_JOB_DIR/in.txt\" && echo '{sha}  '\"$HEPEP_JOB_DIR/in.txt\" | sha256sum -c - "
+              "&& cp \"$HEPEP_JOB_DIR/in.txt\" \"$HEPEP_OUT/\"\n")
+    rec = ep.submit("s1", script, R)
+    assert grid.run(rec.job_id, tmp_path).returncode == 0
+    assert ep.status("s1").state == "done"
+    got = ep.fetch("s1", tmp_path / "fetched")
+    assert any(p.name == "in.txt" and p.read_bytes() == b"payload\n" for p in got)
+
+
+def test_ssh_runner_never_lends_the_callers_stdin(monkeypatch):
+    from hependpoints import runners
+    seen = []
+    monkeypatch.setattr(runners.subprocess, "run", lambda argv, **kw: seen.append(kw) or subprocess.CompletedProcess(
+        argv, 0, b"", b""))
+    runners.ssh_runner("h")(["bash", "-c", "true"], None, 5)
+    runners.ssh_runner("h")(["bash", "-c", "cat"], b"data", 5)
+    assert seen[0]["stdin"] is subprocess.DEVNULL and "input" not in seen[0]
+    assert seen[1]["input"] == b"data" and "stdin" not in seen[1]

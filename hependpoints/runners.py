@@ -13,11 +13,16 @@ Runner = Callable[[Sequence[str], Optional[bytes], float], subprocess.CompletedP
 
 
 def ssh_runner(host: str, connect_timeout: int = 15) -> Runner:
-    """Run each command on `host` through ``ssh -o BatchMode=yes`` (key or Kerberos, never a password prompt)."""
+    """Run each command on `host` through ``ssh -o BatchMode=yes`` (key or Kerberos, never a password prompt).
+
+    A command with no input gets stdin from /dev/null, so ssh never reads the caller's own stdin (a tool server
+    speaking over stdio would otherwise lose its client's requests to a helper ssh)."""
     def run(cmd: Sequence[str], stdin: Optional[bytes], timeout: float) -> subprocess.CompletedProcess:
         remote = " ".join(shlex.quote(c) for c in cmd)
-        return subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={connect_timeout}", host, remote],
-                              input=stdin, capture_output=True, timeout=timeout)
+        argv = ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={connect_timeout}", host, remote]
+        if stdin is None:
+            return subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout)
+        return subprocess.run(argv, input=stdin, capture_output=True, timeout=timeout)
     return run
 
 

@@ -115,7 +115,9 @@ the slice running.
 | `output_dir` | `HEPEP_JOBSUB_OUTPUT_DIR` | dCache scratch directory for results (required) |
 | `host` | `HEPEP_JOBSUB_HOST` | ssh host with jobsub_lite; unset = run on this host |
 | `role` | `HEPEP_JOBSUB_ROLE` | `--role` |
-| `storage_modify` | `HEPEP_JOBSUB_STORAGE_MODIFY` | `--need-storage-modify` (default: `output_dir`) |
+| `storage_modify` | `HEPEP_JOBSUB_STORAGE_MODIFY` | `--need-storage-modify` (default: `token_path(output_dir)`, the logical path) |
+| `mount_prefix` | `HEPEP_JOBSUB_MOUNT_PREFIX` | dCache mount prefix `token_path` drops (default the FNAL one) |
+| `stage_dir` | `HEPEP_JOBSUB_STAGE_DIR` | dCache scratch directory for `stage_file`; unset = no staging |
 | `image` | `HEPEP_JOBSUB_IMAGE` | Apptainer image (`image_option`, default `--singularity-image`) |
 | `tarballs` | `HEPEP_JOBSUB_TARBALL` (comma-separated) | `--tar-file-name` values (`dropbox://...` or an RCDS dir) |
 | `dropbox` | `HEPEP_JOBSUB_DROPBOX` | `cvmfs` or `pnfs` (`--use-<x>-dropbox`) |
@@ -126,7 +128,10 @@ the slice running.
 Also `copy_command` / `mkdir_command` / `remove_command` (default `ifdh cp` / `ifdh mkdir_p` / `ifdh rm`),
 `worker_setup` (shell text run first on the worker), `gpu_types` (`{gpu_type: condor requirement}`), `extra_args`,
 `held_is_failed`, `absent_grace_s`. Resources map to `--cpu`, `--memory=<mem_gb>GB`, `--expected-lifetime=<minutes>m`
-and `--gpu`. Details, the job layout and what has not been run against a real schedd: [docs/jobsub.md](docs/jobsub.md).
+and `--gpu`. `stage_file(src, kind, name, sha256, size)` copies a pinned submit-host file to the stage area once
+(content-addressed, read back and rehashed). `hependpoints.apptainer.sandbox_fallback` renders the job-script lines
+that run a shipped SIF with the worker's Apptainer, unpacking it to a sandbox where /dev/fuse is missing. Details, the
+job layout and what has been run against a real schedd: [docs/jobsub.md](docs/jobsub.md).
 
 ## Plugging in an experiment
 

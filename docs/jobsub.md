@@ -49,6 +49,38 @@ to the intent's token, so results of different attempts can never be confused.
 Files on dCache are read only by known path with `copy_command` into a temporary file on the submit host, never by
 listing or stat-ing the dCache mount.
 
+## Token scope
+
+jobsub_lite strips every `storage.modify` scope from the job token and adds back only the `--need-storage-modify`
+paths, as logical storage paths (the dCache mount prefix dropped). The default `storage_modify` is therefore
+`token_path(output_dir)`: `<mount_prefix>vo/scratch/x/out` becomes `/vo/scratch/x/out`, so the job may write its
+results and nothing else. A job that writes elsewhere needs a wider `storage_modify`; a path outside the submitting
+user's own token scope fails at submit.
+
+## Staging job inputs
+
+A job that needs large inputs (an image, a code tarball, tables), more than the dropbox's per-file limit or more than
+should be re-uploaded per submit, can take them from dCache scratch. `stage_file(src, kind, name, sha256, size)`
+runs on the submit host:
+
+1. a destination already recorded as verified (`<state>/staged/`) is returned without a remote call;
+2. otherwise `src` is rehashed and its size checked against the pin (a changed source is refused);
+3. the destination `<stage_dir>/<kind>/<sha256[:16]>/<name>` is removed, its directory made, and `src` copied with
+   `copy_command`;
+4. the copy is read back into a temporary file on the submit host and rehashed; only a match is recorded.
+
+The job copies the staged paths into `$<PREFIX>_JOB_DIR` with `copy_command` and should check each digest (for
+example `sha256sum -c`) before use. Staged files sit on scratch (LRU-purged): a purged file fails the job's copy, and
+a record can be dropped (delete its JSON under `<state>/staged/`) to stage again.
+
+## Shipping an image: the sandbox fallback
+
+A job that runs its own SIF image with the worker's Apptainer (nested in the job's container) needs FUSE to mount
+the SIF, and many grid workers have no /dev/fuse. `hependpoints.apptainer.sandbox_fallback(...)` renders job-script
+lines that try the SIF with a check command and, when that fails, unpack it with `apptainer build --sandbox` in the
+job directory, delete the SIF and check again; the image and mode (`sif` / `sandbox`) variables tell the rest of the
+script what to run. Size `--disk` for the SIF plus a sandbox of about 3-4 times its size.
+
 ## Recovery
 
 As with Slurm, an intent is written before `jobsub_submit` runs, and any failure after that (timeout, error reply,
