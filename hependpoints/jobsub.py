@@ -10,8 +10,11 @@ Settings come from arguments or the environment, never from the package:
   output_dir      $HEPEP_JOBSUB_OUTPUT_DIR  dCache scratch directory the jobs copy their results to (required)
   host            $HEPEP_JOBSUB_HOST        ssh host of the submit node; unset = run the commands on this host
   role            $HEPEP_JOBSUB_ROLE        ``--role`` (e.g. Analysis); unset = jobsub's default
-  storage_modify  $HEPEP_JOBSUB_STORAGE_MODIFY   ``--need-storage-modify`` path (default: output_dir; jobsub_lite
-                                            rewrites a dCache mount path to the logical token path)
+  storage_modify  $HEPEP_JOBSUB_STORAGE_MODIFY   ``--need-storage-modify`` path (default: the logical token path
+                                            of output_dir, ``token_path``: the dCache mount prefix dropped)
+  mount_prefix    $HEPEP_JOBSUB_MOUNT_PREFIX     dCache mount prefix that ``token_path`` drops (default: the FNAL one)
+  stage_dir       $HEPEP_JOBSUB_STAGE_DIR   dCache scratch directory ``stage_file`` copies job inputs to; unset = no
+                                            staging
   image           $HEPEP_JOBSUB_IMAGE       Apptainer/Singularity image for the job (``image_option``, default
                                             ``--singularity-image``); unset = none
   tarballs        $HEPEP_JOBSUB_TARBALL     ``--tar-file-name`` values (``dropbox://<file>`` or a published RCDS
@@ -40,10 +43,18 @@ State handling mirrors slurm_ssh: a durable intent and a per-handle lock fence e
 whose acknowledgement was lost is reconciled from the ``jobid`` file the job writes when it starts, never
 resubmitted. ``status`` asks ``jobsub_q`` first; once the job has left the queue, ``job.done`` gives the exit code;
 a job gone from the queue with no ``job.done`` after ``absent_grace_s`` is ``failed``. A final state is cached.
-See docs/jobsub.md, including what has not been exercised against a real schedd.
+
+Staging (``stage_file``): a file on the submit host, pinned by sha256 and size, is copied with ``copy_command`` to
+``<stage_dir>/<kind>/<sha256[:16]>/<name>``, then copied back to a temporary file on the submit host and rehashed;
+only a verified copy is recorded (``<state>/staged/``) and later reused without a remote call. A source that no
+longer matches its pin is refused. The job copies staged files in itself (``copy_command``) and should check their
+digests before use. dCache is never listed or stat-ed.
+
+See docs/jobsub.md, including what has and has not been exercised against a real schedd.
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import re
 import shlex
@@ -64,6 +75,9 @@ ACK = re.compile(r"Use job id (\S+) to retrieve output")
 # condor job states as jobsub_q prints them (ST column)
 QUEUE_WORKING = {"I": "idle", "R": "running", "S": "suspended", "<": "transferring input",
                  ">": "transferring output"}
+MOUNT_PREFIX = "/" + "pnfs/"         # the FNAL dCache mount prefix (split: the repository spells out no storage path)
+_SHA = re.compile(r"[0-9a-f]{64}")
+_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
 ABSENT = "__HEPEP_ABSENT__"
 PRESENT = "__HEPEP_PRESENT__"
 
@@ -88,6 +102,13 @@ def parse_queue(text: str, job_id: str) -> Optional[str]:
     return None
 
 
+def token_path(path: str, mount_prefix: str = MOUNT_PREFIX) -> str:
+    """The logical storage path a job token scope names (``--need-storage-modify``): `path` with its dCache mount
+    prefix dropped (``<mount>x/y`` -> ``/x/y``); any other path unchanged."""
+    mount = mount_prefix if mount_prefix.endswith("/") else mount_prefix + "/"
+    return path[len(mount) - 1:] if mount != "/" and path.startswith(mount) else path
+
+
 def _split(value: Optional[str]) -> List[str]:
     return [v for v in (value or "").split(",") if v]
 
@@ -103,6 +124,7 @@ class JobsubEndpoint:
                  image: str | None = None, image_option: str = "--singularity-image",
                  tarballs: Sequence[str] | None = None, dropbox: str | None = None, disk: str | None = None,
                  usage_model: str | None = None, max_minutes: float | None = None,
+                 stage_dir: str | None = None, mount_prefix: str | None = None,
                  copy_command: str = "ifdh cp", mkdir_command: str = "ifdh mkdir_p", remove_command: str = "ifdh rm",
                  worker_setup: str = "", gpu_types: Mapping[str, str] | None = None,
                  extra_args: Sequence[str] = (), state_dir: str | Path | None = None, runner: Optional[Runner] = None,
@@ -118,7 +140,12 @@ class JobsubEndpoint:
                 raise EndpointError(f"{name}: {label} must be an absolute path")
         self.host = host if host is not None else (site.setting("HEPEP_JOBSUB_HOST") or "")
         self.role = role or site.setting("HEPEP_JOBSUB_ROLE") or ""
-        self.storage_modify = storage_modify or site.setting("HEPEP_JOBSUB_STORAGE_MODIFY") or self.output_dir
+        self.mount_prefix = mount_prefix or site.setting("HEPEP_JOBSUB_MOUNT_PREFIX") or MOUNT_PREFIX
+        self.storage_modify = (storage_modify or site.setting("HEPEP_JOBSUB_STORAGE_MODIFY")
+                               or token_path(self.output_dir, self.mount_prefix))
+        self.stage_dir = (stage_dir or site.setting("HEPEP_JOBSUB_STAGE_DIR") or "").rstrip("/")
+        if self.stage_dir and not self.stage_dir.startswith("/"):
+            raise EndpointError(f"{name}: stage_dir must be an absolute path")
         self.image = image or site.setting("HEPEP_JOBSUB_IMAGE") or ""
         self.image_option = image_option
         self.tarballs = list(tarballs) if tarballs is not None else _split(site.setting("HEPEP_JOBSUB_TARBALL"))
@@ -445,3 +472,48 @@ class JobsubEndpoint:
             if queued:                                       # a held job reported failed is still removed
                 self._sh(" ".join(shlex.quote(a) for a in ["jobsub_rm", *self._group_args(), "--jobid", rec.job_id]))
             return "cancelled" if st.state == "working" else st.state
+
+    # -- staging -------------------------------------------------------------------------------------------------
+    def staged_path(self, kind: str, sha256: str, name: str) -> str:
+        """The content-addressed stage path of a file: <stage_dir>/<kind>/<sha256[:16]>/<name>."""
+        if not self.stage_dir:
+            raise EndpointError(f"{self.name}: no stage_dir configured ($HEPEP_JOBSUB_STAGE_DIR)")
+        if not _NAME.fullmatch(kind) or not _NAME.fullmatch(name) or not _SHA.fullmatch(sha256):
+            raise EndpointError(f"{self.name}: bad staging key {kind!r}/{sha256!r}/{name!r}")
+        return f"{self.stage_dir}/{kind}/{sha256[:16]}/{name}"
+
+    def _staged_record(self, dest: str) -> Path:
+        d = self.state.root / "staged"
+        d.mkdir(mode=0o700, parents=True, exist_ok=True)
+        return d / (hashlib.sha256(dest.encode()).hexdigest()[:32] + ".json")
+
+    def remote_sha256(self, path: str) -> Optional[str]:
+        """sha256 of a dCache file, copied to a temporary file on the submit host; None when the copy fails."""
+        q = shlex.quote(path)
+        out = self._sh(f"t=$(mktemp -d) || exit 1; if {self.copy_command} {q} \"$t/f\" >/dev/null 2>&1; then "
+                       f"sha256sum \"$t/f\" | cut -c1-64; else echo ABSENT; fi; rm -rf \"$t\"", timeout=1800).strip()
+        return out if _SHA.fullmatch(out) else None
+
+    def stage_file(self, src: str, kind: str, name: str, sha256: str, size: int) -> str:
+        """Copy the submit-host file `src` (pinned sha256 and size) to ``staged_path(kind, sha256, name)`` once and
+        return that dCache path. A destination recorded as verified is reused without a remote call; otherwise the
+        source is rehashed (a changed source is refused), copied, and the dCache copy rehashed before it is
+        recorded."""
+        dest = self.staged_path(kind, sha256, name)
+        rec = self._staged_record(dest)
+        with submission_lock(rec.parent, rec.stem):
+            old = read_json(rec)
+            if old and old.get("sha256") == sha256 and old.get("size") == size and old.get("dest") == dest:
+                return dest
+            q, qd = shlex.quote(src), shlex.quote(dest)
+            got = self._sh(f"set -e; sha256sum {q} | cut -c1-64; stat -c %s {q}", timeout=1800).split()
+            if got != [sha256, str(size)]:
+                raise EndpointError(f"{self.name}: {src} on the submit host is not the pinned file "
+                                    f"({got} != {[sha256, str(size)]})")
+            self._sh(f"{self.remove_command} {qd} >/dev/null 2>&1; {self.mkdir_command} "
+                     f"{shlex.quote(dest.rsplit('/', 1)[0])} >/dev/null && {self.copy_command} {q} {qd} >/dev/null",
+                     timeout=1800)
+            if self.remote_sha256(dest) != sha256:
+                raise EndpointError(f"{self.name}: staged copy {dest} does not match {src}")
+            durable_json(rec, {"src": src, "dest": dest, "sha256": sha256, "size": size})
+            return dest
