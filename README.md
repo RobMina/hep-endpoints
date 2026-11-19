@@ -182,7 +182,7 @@ The same script runs on the grid with `JobsubEndpoint(environment=env, image=...
 - [docs/admission.md](docs/admission.md): what each endpoint checks before dispatch
 - [docs/gpu-types.md](docs/gpu-types.md): Slurm GPU-type table, the `auto` rule, what is recorded
 - [docs/slurm-recovery.md](docs/slurm-recovery.md): durable intents, locks, reconciliation, limits
-- [docs/jobsub.md](docs/jobsub.md): the jobsub endpoint, its job layout, and what is untested against a real grid
+- [docs/jobsub.md](docs/jobsub.md): the jobsub endpoint, its job layout, and what has been checked on a real grid
 - [docs/artifact-bindings.md](docs/artifact-bindings.md): snapshots, pinned inputs and image checks
 
 License: Apache-2.0 (LICENSE, NOTICE).
