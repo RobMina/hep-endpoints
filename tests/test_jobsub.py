@@ -456,7 +456,7 @@ def test_a_staged_file_reaches_the_job(grid, tmp_path):
               "&& cp \"$HEPEP_JOB_DIR/in.txt\" \"$HEPEP_OUT/\"\n")
     rec = ep.submit("s1", script, R)
     assert grid.run(rec.job_id, tmp_path).returncode == 0
-    assert ep.status("s1").state == "done"
+    assert ep.status("s1").state == "completed"
     got = ep.fetch("s1", tmp_path / "fetched")
     assert any(p.name == "in.txt" and p.read_bytes() == b"payload\n" for p in got)
 

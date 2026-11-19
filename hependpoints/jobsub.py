@@ -12,7 +12,7 @@ Settings come from arguments or the environment, never from the package:
   role            $HEPEP_JOBSUB_ROLE        ``--role`` (e.g. Analysis); unset = jobsub's default
   storage_modify  $HEPEP_JOBSUB_STORAGE_MODIFY   ``--need-storage-modify`` path (default: the logical token path
                                             of output_dir, ``token_path``: the dCache mount prefix dropped)
-  mount_prefix    $HEPEP_JOBSUB_MOUNT_PREFIX     dCache mount prefix that ``token_path`` drops (default ``/pnfs/``)
+  mount_prefix    $HEPEP_JOBSUB_MOUNT_PREFIX     dCache mount prefix that ``token_path`` drops (default: the FNAL one)
   stage_dir       $HEPEP_JOBSUB_STAGE_DIR   dCache scratch directory ``stage_file`` copies job inputs to; unset = no
                                             staging
   image           $HEPEP_JOBSUB_IMAGE       Apptainer/Singularity image for the job (``image_option``, default

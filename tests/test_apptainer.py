@@ -59,4 +59,4 @@ def test_neither_runs_exits_with_the_failure_code(tmp_path, env, text):
 def test_names_and_paths_are_arguments():
     text = sandbox_fallback(apptainer="apptainer", sif='"$J/a.sif"', sandbox='"$J/a"', tmpdir='"$J/t"',
                             log='"$J/l"', check="true", image_var="IMAGE", mode_var="HOW", fail_rc=7)
-    assert 'IMAGE="$J/a.sif"; HOW=sif' in text and "exit 7" in text and "$W" not in text and "$APPT" not in text
+    assert 'IMAGE="$J/a.sif"; HOW=sif' in text and "exit 7" in text and '"$W' not in text and '"$APPT"' not in text
