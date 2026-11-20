@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "hep-endpoints: experiment-neutral adapters for HEP compute endpoints"
+version: "0.1.0"
+date-released: "2026-11-20"
+authors:
+  - family-names: Mina
+    given-names: Rob
+    affiliation: "University of Virginia"
+    orcid: "https://orcid.org/0000-0003-2241-8566"
+repository-code: "https://github.com/RobMina/hep-endpoints"
+license: "Apache-2.0"
+abstract: >-
+  hep-endpoints submits, tracks, fetches and cancels jobs on HEP compute endpoints (Slurm over SSH, FNAL Elastic Analysis Facility, FNAL jobsub_lite) behind one interface, with idempotent handles, durable submission intents, snapshots and artifact bindings.
+keywords:
+  - "workflow"
+  - "Slurm"
+  - "HTCondor"
+  - "jobsub"
+  - "HPC"
+  - "particle physics"

@@ -1,0 +1,30 @@
+{
+  "title": "hep-endpoints: experiment-neutral adapters for HEP compute endpoints",
+  "upload_type": "software",
+  "version": "0.1.0",
+  "description": "hep-endpoints submits, tracks, fetches and cancels jobs on HEP compute endpoints (Slurm over SSH, FNAL Elastic Analysis Facility, FNAL jobsub_lite) behind one interface, with idempotent handles, durable submission intents, snapshots and artifact bindings.",
+  "creators": [
+    {
+      "name": "Mina, Rob",
+      "affiliation": "University of Virginia",
+      "orcid": "0000-0003-2241-8566"
+    }
+  ],
+  "license": "Apache-2.0",
+  "keywords": [
+    "workflow",
+    "Slurm",
+    "HTCondor",
+    "jobsub",
+    "HPC",
+    "particle physics"
+  ],
+  "access_right": "open",
+  "related_identifiers": [
+    {
+      "identifier": "https://github.com/RobMina/hep-endpoints/tree/v0.1.0",
+      "relation": "isSupplementTo",
+      "scheme": "url"
+    }
+  ]
+}
