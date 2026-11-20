@@ -186,3 +186,8 @@ The same script runs on the grid with `JobsubEndpoint(environment=env, image=...
 - [docs/artifact-bindings.md](docs/artifact-bindings.md): snapshots, pinned inputs and image checks
 
 License: Apache-2.0 (LICENSE, NOTICE).
+
+## Citing
+
+Please cite the release you used: `CITATION.cff` holds the metadata (GitHub's "Cite this repository" renders it), and
+each tagged release is archived on Zenodo with its own DOI.
