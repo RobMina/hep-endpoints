@@ -1,5 +1,7 @@
 # hep-endpoints
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24418701.svg)](https://doi.org/10.5281/zenodo.24418701)
+
 Experiment-neutral adapters for running batch jobs on HEP compute endpoints from Python: one small interface
 (submit / status / fetch / cancel) over
 
@@ -190,4 +192,5 @@ License: Apache-2.0 (LICENSE, NOTICE).
 ## Citing
 
 Please cite the release you used: `CITATION.cff` holds the metadata (GitHub's "Cite this repository" renders it), and
-each tagged release is archived on Zenodo with its own DOI.
+each tagged release is archived on Zenodo with its own DOI. The concept DOI
+[10.5281/zenodo.24418701](https://doi.org/10.5281/zenodo.24418701) covers every version and resolves to the latest one.
